@@ -1,45 +1,23 @@
-import time
 import socket
 import serial
 import threading
 import struct
 from queue import Queue
 
-###############################################################
-# Ground to Satellite Communication Support Program
-# 지상국 통신 보조 프로그램
-# 송신과 수신을 각각 담당하는 두개의 아두이노를 이용해 데이터 송/수신
-###############################################################
-
-#########################################################################################
-#
-# 시리얼 통신 및 큐(Queue) 설정
-#
-#########################################################################################
-
 # 송신용 아두이노 시리얼 포트 설정
 ser_tx = serial.Serial(
-    port='/dev/ttyACM1',  # 적절한 포트로 변경
-    baudrate=115200,
-    timeout=1
+    port='/dev/ttyACM0',  # 적절한 포트로 변경
+    baudrate=230400,
 )
 
-# 수신용 아두이노 시리얼 포트 설정
 ser_rx = serial.Serial(
-    port='/dev/ttyACM0',  # 적절한 포트로 변경
-    baudrate=115200,
-    timeout=1
+    port='/dev/ttyACM3',  # 적절한 포트로 변경
+    baudrate=230400,
 )
 
 # UDP/IP 큐(Queue) 설정
 send_queue = Queue()
 receive_queue = Queue()
-
-#########################################################################################
-#
-# 사용할 함수 정의
-#
-#########################################################################################
 
 # UDP/IP 수신
 def udp_receiver():
@@ -52,12 +30,10 @@ def udp_receiver():
     print(f"Listening on {udp_ip}:{udp_port}")
     while True:
         data, addr = sock.recvfrom(1024)
-        print(f"Received UDP message from {addr}: {data}")
-        chunks = split_data(data)
-        for chunk in chunks:
-            send_queue.put(chunk)
-
-# UDP/IP 송신
+        print(f"Received UDP message from {addr}: {data.hex()}")
+        send_queue.put(data)
+        
+#UDP/IP 송신
 def udp_sender():
     udp_ip = "127.0.0.1"
     udp_port = 1235
@@ -74,43 +50,66 @@ def udp_sender():
 def send_to_arduino():
     while True:
         if not send_queue.empty():
-            message = send_queue.get()
-            escaped_message = escape_data(message)
-            if ser_tx.is_open:
-                ser_tx.write(escaped_message)
-                print(f"Message sent to Arduino on port {ser_tx.port}\n")
+            data = send_queue.get()
+            packets = parse_and_split_data(data)
+            for packet in packets:
+                if ser_tx.is_open:
+                    ser_tx.write(packet)
+                    print(f"Sent packet to Arduino: {packet.hex()}")
 
-# 시리얼 수신 및 데이터 처리
-def read_from_arduino():
-    received_data = b''
+#시리얼 수신
+def receive_to_arduino():
     expected_length = None
+    buffer = b''
 
     while True:
         if ser_rx.is_open and ser_rx.in_waiting > 0:
-            incoming_message = ser_rx.read(32)
-            received_data += incoming_message
+            received_data = ser_rx.read(ser_rx.in_waiting)  # 실제 데이터 읽기
+            buffer += received_data
+            print(f"Raw received data: {buffer.hex()}")
 
-            while len(received_data) >= 6:  # 최소한 헤더 크기만큼 데이터가 있어야 함
-                unescaped_data = unescape_data(received_data)
-
+            while len(buffer) >= 6:  # 최소한 헤더 크기만큼 데이터가 있어야 함
                 if expected_length is None:
                     # 헤더를 읽고 전체 패킷 길이 계산
-                    header = unescaped_data[:6]
+                    header = buffer[:6]
                     header_info = parse_primary_header(header)
-                    total_length = header_info["Packet Length"] + 1 + 6  # 패킷 길이 + 1 + 헤더 크기 (6바이트)
+                    total_length = header_info["Packet Length"] + 7  # 패킷 길이 + 6바이트 헤더 + 1바이트 추가
                     expected_length = total_length
+                    print(f"Expected length: {expected_length}")
 
                 # 수신된 데이터의 총 길이가 예상된 길이와 같거나 클 때
-                if len(unescaped_data) >= expected_length:
-                    packet = unescaped_data[:expected_length]  # 패킷을 분리
+                if len(buffer) >= expected_length:
+                    packet = buffer[:expected_length]  # 패킷을 분리
                     print(f"Reassembled Data: {packet.hex()}")
                     receive_queue.put(packet)  # UDP 송신 큐에 추가
-                    received_data = received_data[expected_length:]  # 처리한 패킷을 제거
+                    buffer = buffer[expected_length:]  # 처리한 패킷을 제거
                     expected_length = None
                 else:
                     break
+          
+# 패킷을 파싱
+def parse_and_split_data(data):
+    packets = []
+    data_index = 0
 
-# CCSDS 페킷 헤더 분석
+    while data_index < len(data):
+        if data_index + 6 <= len(data):
+            header = data[data_index:data_index + 6]
+            header_info = parse_primary_header(header)
+            packet_length = header_info["Packet Length"] + 7  # 6바이트 헤더 + 1바이트 추가 (추가 필요 시 조정)
+
+            if data_index + packet_length <= len(data):
+                packet = data[data_index:data_index + packet_length]
+                packets.append(packet)
+                data_index += packet_length
+            else:
+                break
+        else:
+            break
+
+    return packets
+
+# CCSDS 패킷 헤더 분석
 def parse_primary_header(header):
     version_type_secflag_apid = struct.unpack(">H", header[:2])[0]
     seq_flags_seq_count = struct.unpack(">H", header[2:4])[0]
@@ -134,48 +133,22 @@ def parse_primary_header(header):
         "Packet Length": packet_length
     }
 
-# 시리얼 통신시 0x00 바이트인 경우 통신 중단됨.
-# 이를 방지하기 위한 데이터 변조 실시
-def escape_data(data):
-    escaped = data.replace(b'\xFF', b'\xFF\xFF').replace(b'\x00', b'\xFF\x00')
-    return escaped
-
-def unescape_data(data):
-    unescaped = data.replace(b'\xFF\x00', b'\x00').replace(b'\xFF\xFF', b'\xFF')
-    return unescaped
-
-# CCSDS 패킷 분해
-# 헤더는 처음 6바이트까지
-# 32 바이트씩 쪼개서 데이터 저장
-def split_data(data, chunk_size=32):
-    chunks = []
-    for i in range(0, len(data), chunk_size):
-        chunk = data[i:i + chunk_size]
-        chunks.append(chunk)
-    return chunks
-
-#########################################################################################
-#
-# 메인 함수 작성
-#
-#########################################################################################
-
 def main():
     # 스레드 시작
-    udp_recv_thread = threading.Thread(target=udp_receiver)
     udp_send_thread = threading.Thread(target=udp_sender)
+    udp_recv_thread = threading.Thread(target=udp_receiver)
     serial_send_thread = threading.Thread(target=send_to_arduino)
-    serial_recv_thread = threading.Thread(target=read_from_arduino)
+    serial_receive_thread = threading.Thread(target=receive_to_arduino)
     
-    udp_recv_thread.start()
     udp_send_thread.start()
+    udp_recv_thread.start()
     serial_send_thread.start()
-    serial_recv_thread.start()
+    serial_receive_thread.start()
 
-    udp_recv_thread.join()
     udp_send_thread.join()
+    udp_recv_thread.join()
     serial_send_thread.join()
-    serial_recv_thread.join()
+    serial_receive_thread.join()
 
 if __name__ == "__main__":
     main()
